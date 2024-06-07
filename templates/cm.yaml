@@ -1,0 +1,12 @@
+{{- if .Values.files }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "app.fullname" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+data:
+{{- range $key, $val := .Values.files }}
+  {{ $val.path | splitList "/" | last }}: {{ tpl (toYaml $val.value) $ | indent 2 }}
+{{- end -}}
+{{- end }}

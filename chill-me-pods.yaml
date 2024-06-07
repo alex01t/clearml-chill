@@ -1,0 +1,38 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chill-me
+  labels:
+    app: chill-me
+spec:
+  replicas: 12
+  selector:
+    matchLabels:
+      app: chill-me
+  template:
+    metadata:
+      labels:
+        app: chill-me
+    spec:
+      containers:
+      - name: app
+        image: mirror.gcr.io/debian:12
+        command:
+          - bash
+          - -c
+          - |
+            apt update && apt install -y openssl procps
+            function x() {
+              echo "stopping.."
+            }
+            trap x TERM INT
+            R=$((1 + $RANDOM % 10))
+            if [ "$R" -gt 7 ]; then
+              echo hot!
+              openssl speed >/dev/null 2>&1
+            else
+              echo cold..
+              sleep inf
+            fi
+

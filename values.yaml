@@ -1,0 +1,166 @@
+
+nameOverride: "clearml-chill"
+fullnameOverride: "clearml-chill"
+replicaCount: 1
+rbac:
+  enabled: true
+command:
+  - sh
+  - -xc
+  - |
+    pip install --no-cache-dir kubernetes prometheus-api-client pytz humanize
+    exec python /app/chill.py
+image:
+  repository: mirror.gcr.io/python
+  tag: 3.11
+  pullPolicy: IfNotPresent
+  #pullSecrets: [{"name": "regcred"}]
+env:
+  - name: KUBEAPI_TIMEZONE
+    value: 'UTC'
+  - name: PYTHONUNBUFFERED
+    value: "1"
+  - name: PROMETHEUS_URL
+    value: "http://kube-prometheus-stack-prometheus.prometheus:9090/"
+  - name: WATCH_NAMESPACE
+    value: "clearml"
+#  - name: WATCH_LABEL_SECELTOR
+#    value: "clearml-agent-queue-name" # kubeapi pod filter (optional, take all and filter by POD_NAME_REGEX if empty)
+  - name: POD_NAME_REGEX
+    value: "^clearml-id-.+" # prometheus pod filter
+  - name: WATCH_CYCLE_TIMEOUT_SECONDS
+    value: "30"
+  - name: CPU_USAGE_CHILL_WINDOW
+    value: "30m" # check cpu usage of last 30 min, also see CHILL_POD_MINIMUM_AGE_SECONDS
+#    value: "5m" # for debug
+  - name: CPU_USAGE_CHILL_THRESHOLD
+    value: "0.05" # chill pods that use less than this% cpu for CPU_USAGE_CHILL_WINDOW
+  - name: CHILL_POD_MINIMUM_AGE_SECONDS
+    value: "1800" # don't chill very young pods, should not be less than CPU_USAGE_CHILL_WINDOW
+#    value: "300" # for debug
+  - name: NO_CHILL_QUEUE_REGEX
+    value: "^(default)$" # don't chill pods in these queues
+  - name: DRY_RUN
+    value: ""
+
+files:
+  - path: /app/chill.py
+    value: |
+      from prometheus_api_client import PrometheusConnect
+      from prometheus_api_client.utils import parse_datetime
+      from kubernetes import client, config
+      import os, time, pytz, re, humanize, random
+      from datetime import datetime, timedelta
+
+      prom = PrometheusConnect(url=os.environ.get('PROMETHEUS_URL'), disable_ssl=True)
+      config.load_incluster_config()
+      v1 = client.CoreV1Api()
+      tz = pytz.timezone(os.environ.get('KUBEAPI_TIMEZONE'))
+
+      while True:
+          print(f'=== DRY_RUN = {bool(os.environ.get("DRY_RUN"))} =======================================')
+          cpu_usage_metrics = prom.custom_query_range(
+              '''
+                  sum by (namespace, pod) (
+                      rate(
+                          container_cpu_usage_seconds_total{
+                              namespace=~"''' + os.environ.get('WATCH_NAMESPACE') + '''",
+                              pod=~"''' + os.environ.get('POD_NAME_REGEX') + '''",
+                              container!=""
+                          }
+                      [2m])
+                  )
+              ''',
+              start_time=parse_datetime(os.environ.get('CPU_USAGE_CHILL_WINDOW')),
+              end_time=parse_datetime("now"),
+              step="10"
+          )
+          print(f'prometheus: got cpu usage metrics for {len(cpu_usage_metrics)} pods matching POD_NAME_REGEX')
+          cpu_by_pod = {}
+          for m in cpu_usage_metrics:
+              cpu_by_pod[m['metric']['pod']] = [round(float(v[1]), 3) for v in m['values']]
+
+          pod_list = v1.list_namespaced_pod(os.environ.get('WATCH_NAMESPACE'), label_selector=os.environ.get('WATCH_LABEL_SECELTOR')).items
+          print(f'kubeapi: got info for {len(pod_list)} pods matching WATCH_LABEL_SECELTOR')
+
+          pod_list = [p for p in pod_list if re.search(os.environ.get('POD_NAME_REGEX'), p.metadata.name) ]
+          print(f'kubeapi: got info for {len(pod_list)} pods matching POD_NAME_REGEX')
+          print()
+
+          random.shuffle(pod_list) # in case one special pod crashloops the cycle
+          for pod in pod_list:
+              print('------------------------------')
+              # decision making tags list
+              tags = []
+              pod_queue = pod.metadata.labels.get('clearml-agent-queue-name')
+
+              # analyze running time
+              pod_running_time = (datetime.now().replace(tzinfo=tz) - pod.status.start_time.replace(tzinfo=tz)) \
+                  if pod.status.start_time else timedelta(seconds=0)
+              if pod_running_time < timedelta(seconds=int(os.environ.get('CHILL_POD_MINIMUM_AGE_SECONDS'))):
+                  tags.append('FRESH')
+
+              # analyze cpu usage
+              cpu_usage_stat = []
+              cpu_usage_metrics = cpu_by_pod.get(pod.metadata.name)
+              if cpu_usage_metrics:
+                  cpu_usage_avg = round(sum(cpu_usage_metrics) / len(cpu_usage_metrics), 3)
+                  cpu_usage_min = min(cpu_usage_metrics)
+                  cpu_usage_max = max(cpu_usage_metrics)
+                  # array for logs
+                  cpu_usage_stat = [cpu_usage_min, cpu_usage_avg, cpu_usage_max]
+                  # setting cpu usage tags
+                  if cpu_usage_max < float(os.environ.get('CPU_USAGE_CHILL_THRESHOLD')):
+                      tags.append('LOW_CPU')
+                  if cpu_usage_avg > 5.0:
+                      tags.append('HIGH_CPU')
+
+              # log info
+              print(f"{pod.metadata.name} - {pod.status.phase} {humanize.naturaldelta(pod_running_time)} in '{pod_queue}' cpu{cpu_usage_stat} {tags}")
+
+              # decide
+              if re.search(os.environ.get('NO_CHILL_QUEUE_REGEX', ''), pod_queue):
+                  print(f"* queue '{pod_queue}' is not supposed to be chilled due to NO_CHILL_QUEUE_REGEX")
+                  continue
+
+              if 'FRESH' in tags:
+                  print(f'* pod {pod.metadata.name} is running for less than CHILL_POD_MINIMUM_AGE_SECONDS, skip it')
+                  continue
+
+              if 'LOW_CPU' in tags:
+                  print(f'* will DELETE pod {pod.metadata.name} because of low cpu usage')
+                  if not bool(os.environ.get('DRY_RUN')):
+                      r = v1.delete_namespaced_pod(pod.metadata.name, pod.metadata.namespace)
+                      time.sleep(3)
+
+          print()
+          print(f"end cycle, wait for {os.environ.get('WATCH_CYCLE_TIMEOUT_SECONDS')}")
+          print()
+          if bool(os.environ.get('ONE_CYCLE')):
+              break
+          time.sleep(int(os.environ.get('WATCH_CYCLE_TIMEOUT_SECONDS')))
+
+
+resources:
+  requests:
+    memory: "200Mi"
+    cpu: "50m"
+  limits:
+    memory: "200Mi"
+    cpu: "1000m"
+revisionHistoryLimit: 2
+minReadySeconds: 10
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 1
+podAnnotations: {}
+podSecurityContext: {}
+startupProbe: {}
+livenessProbe: {}
+readinessProbe: {}
+ports: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
